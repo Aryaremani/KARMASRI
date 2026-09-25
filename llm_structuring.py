@@ -33,339 +33,313 @@ except ImportError:
 
 BASE_PROMPT_TEMPLATE = '''Your task is to analyze the OCR text and extract the information into STRICT JSON format.
 
-IMPORTANT RULES:
+=== GENERAL RULES ===
+1. Return ONLY valid JSON. No markdown, no explanations, no comments outside the JSON object.
+2. Do not guess or invent values. If a value cannot be identified, return null.
+3. Correct obvious OCR formatting errors only when the intended value is clear.
+4. Extract every available bill, invoice, receipt, estimate, pharmacy, hospital,
+   clinic, laboratory, or dental line item.
+5. Dates should preferably be returned as YYYY-MM-DD when clearly identifiable.
+6. If multiple possible bill numbers or dates exist, select the one associated
+   with the main invoice/bill.
+7. Never infer medical conditions or diagnoses unless explicitly written in the bill.
 
-1. Return ONLY valid JSON.
+=== PATIENT NAME RULES ===
+8. Name of the patient. On a standard hospital/clinic BILL or INVOICE, the patient's
+   name commonly appears as "Name <patient name>" on the same line as, or immediately
+   next to, "Bill No <number>" (e.g. "Name SREEDEVI Bill No 3193") — extract ONLY the
+   name portion as patient_name, and the number portion as bill_no; do not merge them,
+   drop the name, or leave patient_name null when it is present in this form (see
+   Example F below).
+8a. When the document is an ESTIMATE rather than a BILL/INVOICE, the patient's name
+   may instead appear directly below or beside the word "Estimate" and before
+   "Prepared By". Treat that name as patient_name when the layout clearly indicates
+   it is the person receiving the estimate (see Example E below).
 
-2. Do not include markdown, explanations, or comments.
+=== ITEM NAME RULES ===
+9. Keep item_name CLEAN — the product/service name only. Strip out HSN codes, batch
+   numbers, expiry dates, and location/bin codes even when jammed together with the
+   name in the OCR text (e.g. "30049035 EMESET4MG INJ2ML A-38 S620043 05/25" becomes
+   item_name "Emeset 4mg Injection 2ml" — nothing else).
+10. NEVER treat a tooth number, tooth/area code, surface code, or other location
+    identifier as a quantity or leave it attached to item_name. Dental/medical bills
+    often have a "Tooth/Area" column with values like "23" or "11,12" — these identify
+    WHERE a procedure was performed, not HOW MANY units. Only populate "quantity" when
+    the source explicitly states a count (e.g. "Qty: 2", "x3", "2 vials").
+10a. NEVER default a blank/missing quantity to 1. Many pharmacy/hospital bill rows
+    have their Qty column blank or illegible for that specific row, even while other
+    rows in the same table DO show a quantity — treat each row independently. Use the
+    sanity check unit_price × quantity ≈ amount: if the OCR line only shows a rate and
+    a final amount with no explicit count between them, and amount is NOT equal to
+    unit_price (e.g. rate 12.90, amount 51.60 — a hidden quantity of 4), set quantity
+    to null rather than guessing 1. Guessing 1 when the true quantity was blank/missing
+    is just as wrong as inventing any other number (see Example G below).
+10b. WATCH FOR A DATE FUSED WITH A STRAY DIGIT STRING (OCR artifact): a date in the
+    OCR text is sometimes immediately followed, with NO space, by extra digits that
+    do not belong to it — e.g. "25/10/202237" is really the date "25/10/2022" plus a
+    stray "37" fused onto the end by an OCR line-merge error. NEVER read that trailing
+    fused digit string as quantity. Use the sanity check: if treating it as quantity
+    would make unit_price × quantity wildly exceed the line's actual amount (e.g.
+    quantity 37 × rate 250.00 = 9250, but amount shown is only 250.00), that mismatch
+    itself is the sign the digits are a date artifact, not a real quantity — set
+    quantity to null instead (see Example H below).
 
-3. Do not guess or invent values.
+=== AMOUNT, DECIMAL & QUANTITY RULES ===
+11. Convert numeric amounts to numbers without currency symbols or commas.
+12. Do not confuse MRP, unit price, discount, tax, quantity, and final line amount.
+    The "amount" for each item is whatever final figure appears in the bill's own
+    Fee/Amount column — never recompute it by multiplying unit_price by a
+    tooth/area number, and never substitute a different column's value for it.
+    Apply the decimal-point corrections in Rule 13 and the blank-column handling
+    in Rule 14 to this figure where they apply — "use the Fee/Amount column's
+    figure" and "fix an OCR-dropped decimal in that figure" are the same
+    instruction, not competing ones.
+13. DECIMAL POINT ERRORS (common OCR issue) — currency amounts always have exactly
+    2 decimal digits. Watch for two patterns where the decimal got lost:
+    (a) DROPPED ENTIRELY: a large whole number with NO decimal point at all next to
+        amounts that clearly use "X,XXX.00" format (e.g. "500000" near other
+        properly-formatted amounts) → insert the decimal 2 digits from the right:
+        "500000" -> 5000.00. Never copy a neighboring number's decimal position.
+    (b) REPLACED BY A SPACE: a scanned column gap read as whitespace instead of ".",
+        producing two space-separated tokens where the second is exactly 2 digits
+        (e.g. "5000 00") → join them: "5000 00" -> 5000.00.
+    Only apply either fix when the source token has NO decimal point already. If a
+    number already shows "20000.00", leave it untouched even if it looks large.
+14. Watch for pharmacy rows like "MRP | Dis. | GST | Total" where Dis./GST are blank,
+    so the OCR line only has TWO numbers (e.g. "14.53 29.06"). The LAST number is
+    always the line "amount" — never copy MRP/unit_price into amount just because
+    fewer numbers than expected appear, and never repurpose that last number into
+    "discount" either; leave discount/tax null if genuinely blank.
 
-4. If a value cannot be identified, return null.
+=== TOTAL_AMOUNT RULES (highest-risk field — read carefully) ===
+15. total_amount must represent the final/net amount payable whenever available.
+16. NEVER confuse bill_no, patient/OP/IP numbers, or batch numbers with total_amount,
+    even when they sit visually close to a "TOTAL" label due to OCR reading order.
+    Only use a number as total_amount if it appears directly in the TOTAL/grand
+    total column, formatted as currency (decimals like "1,234.00", or clearly in a
+    totals row).
+17. If the totals area is blank, cut off, illegible, or the text ends with "Continue"
+    (or an OCR-garbled variant — "Contnue", "Continu", "Cont1nue", or any word
+    starting with "Cont" near TOTAL/GRAND TOTAL) — set total_amount to null. Do not
+    substitute a nearby unrelated number just because the word wasn't spelled right.
+18. The true grand total sometimes appears as a bare, unlabeled number on its own
+    line right after the last item (label lost to OCR). If a standalone
+    currency-formatted number sits there and isn't already an item amount, treat it
+    as total_amount — this does not override rule 16 (still never use an ID number).
 
-5. Correct obvious OCR formatting errors only when the intended value is clear.
+=== DUPLICATE-SECTION RULE ===
+19. Some bills show the same charges TWICE: once as category subtotals ("Bill
+    Summary" — e.g. "Room & Nursing Charges: 2350.00") and again as a fully itemized
+    breakdown ("Detailed Breakup") that sums to those same subtotals. These describe
+    the SAME money. When both sections exist, extract items ONLY from the
+    detailed/itemized section. If a bill has ONLY a summary section with no further
+    breakdown, extract the summary rows as items instead — they're the only detail
+    available.
 
-6. Preserve medicine/test/service names as accurately as possible, but keep
-item_name CLEAN — the product/service name only. Strip out HSN codes, batch
-numbers, expiry dates, and location/bin codes even when they're jammed
-together with the name in the OCR text (e.g. "30049035 EMESET4MG INJ2ML
-A-38 S620043 05/25" should become item_name "Emeset 4mg Injection 2ml" —
-nothing else).
+=== FEW-SHOT EXAMPLES ===
 
-7. Convert numeric amounts to numbers without currency symbols or commas.
-
-8. Dates should preferably be returned as YYYY-MM-DD when clearly identifiable.
-
-9. Extract every available bill, invoice, receipt, estimate,
-pharmacy, hospital, clinic, laboratory, or dental line item.
-
-10. Do not confuse MRP, unit price, discount, tax, quantity, and final line amount.
-
-10a. NEVER treat a tooth number, tooth/area code, surface code, or other
-location identifier as a quantity. Dental and medical bills often have a
-"Tooth/Area", "Tooth No.", or "Surface" column containing values like "23",
-"11,12", or "23-24" — these identify WHERE the procedure was performed, not
-HOW MANY units were billed. Do not multiply the fee by this number. The
-"amount" for each item is whatever final figure appears in the bill's own
-Fee/Amount column for that line — copy it directly, do not recompute it by
-multiplying unit_price by a tooth/area number. Only populate "quantity" when
-the source explicitly states a count of units (e.g. "Qty: 2", "x3", "2
-vials") — if a number near an item is a tooth/area/surface reference
-instead, leave quantity null.
-
-11. The total_amount must represent the final/net amount payable whenever available.
-
-12. If multiple possible bill numbers or dates exist, select the one associated with the main invoice/bill.
-
-13. Never infer medical conditions or diagnoses unless they are explicitly written in the bill.
-
-14. NEVER confuse bill_no, patient/OP/IP numbers, batch numbers, or any other
-ID-style number with total_amount. These numbers often sit visually close to
-a "TOTAL" label due to OCR reading order, but a bill number (e.g.
-"2223/167720") is NOT a monetary total, even if part of it (e.g. "2223")
-looks like a plausible amount on its own. Only use a number as total_amount
-if it appears directly in the TOTAL/grand total column of the bill itself,
-formatted as a currency amount (with decimals like "1,234.00" or clearly
-in a totals row/column). If the actual TOTAL column appears blank, cut off,
-illegible, or the bill text ends with words like "Continue" (indicating the
-totals are on a page you don't have), set total_amount to null rather than
-substituting a nearby unrelated number. Watch for OCR-GARBLED spellings of
-"Continue" near the TOTAL row too, not just the exact word -- OCR frequently
-mangles it into things like "Contnue", "Continu", "Cont1nue", "Contlnue", or
-similar near-matches. Any word starting with "Cont" sitting next to or below
-the TOTAL/GRAND TOTAL label is almost certainly a garbled "Continue" and
-should be treated the same as the exact word: set total_amount to null,
-do not use a stray nearby number as the total just because "Continue" itself
-wasn't spelled correctly.
-
-15. WATCH FOR MISSING DECIMAL POINTS (a common OCR error): standard currency
-amounts always have exactly 2 decimal digits. If an amount appears as a
-large whole number with NO decimal point anywhere in it (e.g. "500000" or
-"600000"), while other amounts nearby use a clear "X,XXX.00" format, the
-decimal point was almost certainly dropped by OCR. Fix it by inserting the
-decimal point exactly 2 digits from the right — e.g. "500000" -> 5000.00,
-"600000" -> 6000.00 — NEVER by copying the decimal position of a
-neighboring number, and never leaving it as a larger value like 50000.00.
-ONLY apply this fix to amounts that have NO decimal point at all in the
-source text. If a number already contains a decimal point (e.g.
-"20000.00"), it is already correctly formatted — do NOT alter it, even if
-it looks unusually large next to other items. Cross-check your
-reinterpretation against any explicit total/subtotal shown elsewhere in the
-document if one exists — the corrected line items should sum to that total.
-
-15a. WATCH FOR A DECIMAL POINT REPLACED BY A SPACE: sometimes the source is
-a scanned image where a currency amount's decimal point sits in a column
-gap, and OCR reads that gap as whitespace instead of a "." — so an amount
-that should be "5000.00" appears in the OCR text as two space-separated
-number tokens: "5000 00" (or with extra spaces, "5000  00"). Do NOT treat
-these as two separate numbers, and do NOT drop the trailing token or treat
-it as a quantity. If a number token sitting where an amount is expected is
-immediately followed by a short 2-digit token (e.g. "00", "25", "50"),
-recognize this as the decimal/paise portion and join them with a "." — e.g.
-"5000 00" -> 5000.00, "6000 00" -> 6000.00. This differs from rule 15
-above (digits OCR'd with NO separator at all, like "500000"); this rule
-covers the case where the separator became a space instead of being
-dropped entirely.
-
-16. WATCH FOR UNLABELED TOTALS: the true grand total sometimes appears as a
-bare number on its own line immediately after the last line item, with NO
-"Total:"/"Grand Total:" label in front of it (the label may have been on a
-different line/column that OCR failed to associate with the number). If you
-see a standalone number formatted as currency (e.g. "71,300.00" or
-"71300.00") sitting right after the last item, and it is not already one of
-the item amounts, treat it as total_amount. This does not override rule 14:
-still never use a bill/patient/batch ID number as the total. And if the
-totals area is genuinely blank, cut off, or illegible, still set
-total_amount to null per rule 14 — do not invent a number that isn't there.
-
-17. DO NOT DOUBLE-COUNT A SUMMARY SECTION AND A DETAILED SECTION: some bills
-show the same charges TWICE in two different tables — once as broad
-category subtotals (often titled "Bill Summary", "Summary", or similar,
-with rows like "Room & Nursing Charges: 2350.00", "Professional Fees:
-1200.00") and again as fully itemized individual charges in a separate
-section (often titled "Detailed Breakup", "Itemized Bill", or similar) that
-breaks those same categories down into their individual components. These
-two sections describe the SAME money, not additional charges — the
-itemized rows are what sum up to each category subtotal. When a bill has
-both a category-summary section and a detailed/itemized section, extract
-items ONLY from the detailed/itemized section into the items array. Do NOT
-also add the category-summary rows as additional items — doing so counts
-the same charges twice and inflates the sum of items well past the actual
-total_amount. If a bill has ONLY a summary-style section with no further
-itemized breakdown anywhere, then extract those summary rows as the items
-instead, since in that case they're the only line-item detail available.
-
-18. WATCH FOR SKIPPED BLANK COLUMNS CAUSING MRP/TOTAL CONFUSION: pharmacy
-bills often have a row of columns like "MRP | Dis. | GST | Total" (or
-similar: MRP, Discount, Tax, then a final line Total). When Dis. and/or GST
-are BLANK for a row, the OCR text for that line will only contain TWO
-numbers even though the header implies four columns — e.g. "14.53 29.06"
-where 14.53 is MRP and 29.06 is the actual line Total, with no
-discount/GST value present at all. In this situation:
-- The LAST number on the line (rightmost, under the "Total" header) is
-  always the line's "amount" — NEVER copy the MRP/unit_price value into
-  amount just because fewer numbers than expected appear on the line.
-- Do NOT treat that last number as "discount" either. If the Dis. and GST
-  columns are genuinely blank in the source, leave "discount" and "tax"
-  null for that row — don't repurpose the Total value to fill them.
-- A quick sanity check: unit_price × quantity should equal (or be very
-  close to) amount when quantity is known. If your extracted amount
-  instead exactly equals unit_price, that's a strong signal you've
-  fallen into this trap and should re-map: amount = the true line Total,
-  not a copy of MRP.
-
-Return JSON using exactly this structure:
-
+Example A — dropped decimal + tooth code:
+OCR TEXT:
+"Implant-MegaGen AnyRidge 23   500000
+Tooth: 23"
+CORRECT ITEM OUTPUT:
 {
-
-  "bill_no": null,
-
-  "patient_name": null,
-
-  "bill_date": null,
-
-  "hospital_name": null,
-
-  "doctor_name": null,
-
-  "items": [
-
-    {
-
-      "item_name": null,
-
-      "quantity": null,
-
-      "unit_price": null,
-
-      "discount": null,
-
-      "tax": null,
-
-      "amount": null
-
-    }
-
-  ],
-
-  "subtotal": null,
-
-  "taxable_value": null,
-
-  "discount_amount": null,
-
-  "tax_amount": null,
-
-  "cgst_amount": null,
-
-  "sgst_amount": null,
-
-  "igst_amount": null,
-
-  "total_amount": null,
-
-  "currency": null
-
+  "item_name": "Implant-MegaGen AnyRidge",
+  "quantity": null, "unit_price": null, "discount": null, "tax": null,
+  "amount": 5000.00
 }
+(The "23" is a tooth code — stripped from item_name, never used as quantity.
+"500000" had no decimal point — corrected to 5000.00.)
 
-FIELD DEFINITIONS:
+Example B — unlabeled total after last item:
+OCR TEXT:
+"CBC Test          450.00
+Lipid Profile      650.00
+1,100.00"
+CORRECT OUTPUT (relevant fields):
+{ "items": [
+    {"item_name": "CBC Test", "amount": 450.00, ...},
+    {"item_name": "Lipid Profile", "amount": 650.00, ...}
+  ],
+  "total_amount": 1100.00 }
+(The bare "1,100.00" line has no "Total:" label but is the sum right after the
+last item — treated as total_amount per rule 18.)
 
-bill_no:
+Example C — "Continue" near TOTAL (garbled OCR):
+OCR TEXT:
+"Sub Total   45,200.00
+TOTAL   Contnue"
+CORRECT OUTPUT (relevant field):
+{ "total_amount": null }
+(Word starting with "Cont" sits next to TOTAL — this is a garbled "Continue",
+meaning the real total is on a page not captured. Do not use 45,200.00 or any
+other nearby number.)
 
-Invoice number, bill number, receipt number, or invoice ID.
+Example D — summary AND detailed sections both present:
+OCR TEXT:
+"Bill Summary
+Room & Nursing Charges   2350.00
+Professional Fees        1200.00
 
-patient_name:
+Detailed Breakup
+Room Rent (3 days)        900.00
+Nursing Charges           1450.00
+Consultant Visit Fee      1200.00"
+CORRECT OUTPUT: items = [Room Rent 900.00, Nursing Charges 1450.00,
+Consultant Visit Fee 1200.00] — the Bill Summary rows are NOT added as
+separate items; they are the same charges already captured in Detailed Breakup.
 
-When the document is an ESTIMATE rather than a BILL/INVOICE,
-the patient's name may appear directly below or beside the word
-"Estimate" and before "Prepared By". Treat that name as patient_name
-when the layout clearly indicates it is the person receiving the estimate.
-
-For example:
+Example E — Estimate document, patient_name between "Estimate" and "Prepared By":
+OCR TEXT:
 "Estimate
 Pradeep Kumar E IFS (21118)
 Prepared By: Dr. Jensy George"
+CORRECT OUTPUT (relevant field):
+{ "patient_name": "Pradeep Kumar E IFS" }
+(This is an Estimate, not a Bill/Invoice. The name sits between "Estimate" and
+"Prepared By" — that is the patient, per rule 8. The "(21118)" code is not
+part of the name.)
 
-should produce:
-"patient_name": "Pradeep Kumar E IFS"
+Example F — standard bill header, "Name X ... Bill No Y" on the same line:
+OCR TEXT:
+"Name SREEDEVI Bill No 3193
+Address VASUMANA,PULLIKANAKKUPO Date 27/10/2022"
+CORRECT OUTPUT (relevant fields):
+{ "patient_name": "SREEDEVI", "bill_no": "3193" }
+(This is a standard Bill/Invoice, not an Estimate — rule 8 applies, not 8a. "SREEDEVI"
+is the patient name and "3193" is the bill number; neither is merged into the other,
+and patient_name is NOT left null just because the layout is compact.)
 
-Name of the patient.
+Example G — blank quantity should stay null, never default to 1:
+OCR TEXT:
+"CHYMOLEXTAB 99556 25/10/2022 12.90 51.60"
+CORRECT ITEM OUTPUT:
+{
+  "item_name": "CHYMOLEXTAB",
+  "quantity": null, "unit_price": 12.90, "discount": null, "tax": null,
+  "amount": 51.60
+}
+(No explicit count appears on this line — only a rate (12.90) and a final amount
+(51.60). Since 51.60 is NOT equal to 12.90, a quantity was clearly involved (here,
+4), but it isn't stated in the OCR text, so quantity is left null per rule 10a
+rather than guessed as 1. The "amount" is still copied directly as 51.60 — do not
+recompute it as unit_price × 1.)
 
-bill_date:
+Example H — stray digits fused onto a date are NOT a quantity:
+OCR TEXT:
+"MOPPING PAD 30 X 30 99554 25/10/202237 250.00 250.00"
+CORRECT ITEM OUTPUT:
+{
+  "item_name": "MOPPING PAD 30 X 30",
+  "quantity": null, "unit_price": 250.00, "discount": null, "tax": null,
+  "amount": 250.00
+}
+(The date reads "25/10/2022" with a stray "37" fused onto the end — an OCR
+line-merge artifact, not a quantity. Treating 37 as quantity would give
+37 × 250.00 = 9250.00, wildly more than the actual amount of 250.00 shown on
+the line — that mismatch is the giveaway per rule 10b. quantity is left null,
+and amount is copied directly as the 250.00 that actually appears in the
+Amount column.)
 
-Primary invoice/bill date.
-
-hospital_name:
-
-Hospital, clinic, laboratory, or pharmacy name.
-
-doctor_name:
-
-Doctor/consultant name if explicitly available.
-
-items:
-
-Every individual medicine, laboratory test, procedure, consultation, room charge, service, consumable, or other billed item.
-
-item_name:
-
-Just the clean, human-readable product/service/medicine name — e.g.
-"Emeset 4mg Injection 2ml", "Disposable Syringe 5ml", "CBCT Full Mouth".
-Do NOT include HSN/item codes, batch numbers, expiry dates, location/bin
-codes, or manufacturer codes in item_name — strip all of that out even if
-it appears directly next to the name in the OCR text. Those code numbers
-are not part of the item's name.
-
-quantity:
-
-Number of units/items — ONLY when explicitly stated as a count (e.g. "Qty:
-2", "x3") in a Units/Qty column of its own. A tooth number, tooth/area
-code, or surface code (e.g. "23", "11,12") is NOT a quantity — leave
-quantity null for those and do not use that number to multiply the fee. If
-the Units/Qty column is blank, missing, or illegible for a given row, set
-quantity to null — do NOT reuse that row's amount or rate as the quantity
-just because a number happens to be nearby.
-
-unit_price:
-
-Price per individual unit.
-
-discount:
-
-Discount applicable to this line item.
-
-tax:
-
-Tax/GST applicable to this line item.
-
-amount:
-
-Final amount of this particular line item.
-
-subtotal:
-
-Amount before overall discounts/taxes when available.
-
-taxable_value:
-
-The amount subject to tax, when the bill explicitly shows a "Taxable
-Value" column or field separate from CGST/SGST/IGST — this is usually the
-figure GST percentages get applied to. Only fill this if the bill actually
-labels a value as "Taxable Value" (or clear equivalent); do not infer it by
-subtracting tax from the total yourself.
-
-discount_amount:
-
-Total bill-level discount.
-
-tax_amount:
-
-Total GST/tax amount (combined, if the bill only shows one overall tax
-figure rather than splitting CGST/SGST/IGST separately).
-
-cgst_amount:
-
-Central GST amount, only if explicitly shown as a separate labeled figure
-(not just a column header with no value filled in).
-
-sgst_amount:
-
-State GST amount, only if explicitly shown as a separate labeled figure.
-
-igst_amount:
-
-Integrated GST amount, only if explicitly shown as a separate labeled
-figure (used for inter-state bills instead of CGST+SGST).
-
-total_amount:
-
-Final/net/grand amount payable.
-
-currency:
-
-Currency such as INR, USD, AED, etc. If the ₹ symbol or Indian bill format is clearly present, return "INR".
-
-If an item contains only item name and amount, return:
+=== OUTPUT SCHEMA ===
+Return JSON using exactly this structure. The "_reasoning" field comes first:
+briefly note (1-3 short sentences) which total_amount source you used, whether
+this is a standard Bill or an Estimate (and where you found patient_name either
+way), whether any Continue/duplicate-section pattern applied, any decimal
+correction made, and whether any item's quantity was left null because it
+wasn't explicitly stated (rather than defaulted to 1). Keep it short — it will
+be stripped before the data is used; its only purpose is to make you check
+yourself before filling the fields below it.
 
 {
-
-  "item_name": "CBC Test",
-
-  "quantity": null,
-
-  "unit_price": null,
-
-  "discount": null,
-
-  "tax": null,
-
-  "amount": 450.00
-
+  "_reasoning": null,
+  "bill_no": null,
+  "patient_name": null,
+  "bill_date": null,
+  "hospital_name": null,
+  "doctor_name": null,
+  "items": [
+    {
+      "item_name": null,
+      "quantity": null,
+      "unit_price": null,
+      "discount": null,
+      "tax": null,
+      "amount": null
+    }
+  ],
+  "subtotal": null,
+  "taxable_value": null,
+  "discount_amount": null,
+  "tax_amount": null,
+  "cgst_amount": null,
+  "sgst_amount": null,
+  "igst_amount": null,
+  "total_amount": null,
+  "currency": null
 }
 
-OCR TEXT:
+FIELD DEFINITIONS:
+bill_no: Invoice number, bill number, receipt number, or invoice ID.
+patient_name: Name of the patient (see rule 8 for the Estimate-specific case).
+bill_date: Primary invoice/bill date, as YYYY-MM-DD when clearly identifiable.
+hospital_name: Hospital, clinic, laboratory, or pharmacy name.
+doctor_name: Doctor/consultant name if explicitly available.
+items: Every individual medicine, lab test, procedure, consultation, room charge,
+  service, consumable, or other billed item.
+quantity: ONLY when explicitly stated as a count in a Units/Qty column of its own —
+  never a tooth/area/surface code. Null if that column is blank/missing/illegible.
+unit_price: Price per individual unit.
+discount / tax: Line-level discount/tax when explicitly shown.
+amount: Final amount of this particular line item.
+subtotal: Amount before overall discounts/taxes when available.
+taxable_value: Only fill if the bill explicitly labels a "Taxable Value" field —
+  do not infer it by subtracting tax from total yourself.
+discount_amount / tax_amount: Bill-level totals.
+cgst_amount / sgst_amount / igst_amount: Only if explicitly shown as separate
+  labeled figures.
+total_amount: Final/net/grand amount payable.
+currency: INR if the ₹ symbol or Indian bill format is present, else as identified.
 
+If an item contains only item name and amount, return:
+{
+  "item_name": "CBC Test",
+  "quantity": null, "unit_price": null, "discount": null, "tax": null,
+  "amount": 450.00
+}
+
+=== FINAL REMINDER (most important) ===
+Before you output total_amount, double-check it is not a bill number, patient/OP/IP
+number, or batch number. If the true total is missing, cut off, or blocked by a
+"Continue" (even garbled), output null rather than guessing. This single field
+causes the most downstream damage when wrong.
+
+OCR TEXT:
 {{OCR_TEXT}}'''
+
+
+# Reminder of the required output shape, included in the retry prompt below.
+# RETRY_PROMPT_TEMPLATE deliberately does NOT repeat the full BASE_PROMPT
+# rule set (that would defeat the point of a smaller, targeted retry ask),
+# but omitting the schema entirely meant the model had to reproduce a
+# nested JSON structure from memory on retry -- with nothing to check
+# against, it's more likely to drop fields or drift format, independent of
+# whether it fixes the original mismatch. This keeps the retry prompt
+# targeted while still anchoring the exact field names/shape expected.
+JSON_SCHEMA_REMINDER = '''Required JSON shape (keep this exact set of fields,
+even for values you leave null — "_reasoning" included):
+{
+  "_reasoning": null,
+  "bill_no": null, "patient_name": null, "bill_date": null,
+  "hospital_name": null, "doctor_name": null,
+  "items": [
+    {"item_name": null, "quantity": null, "unit_price": null,
+     "discount": null, "tax": null, "amount": null}
+  ],
+  "subtotal": null, "taxable_value": null, "discount_amount": null,
+  "tax_amount": null, "cgst_amount": null, "sgst_amount": null,
+  "igst_amount": null, "total_amount": null, "currency": null
+}'''
 
 
 RETRY_PROMPT_TEMPLATE = """
@@ -403,6 +377,8 @@ Return a corrected JSON object in the same format as before. If you cannot
 confidently fix a specific item after checking for the decimal-point issue
 above, set it to null rather than guessing.
 
+{schema_reminder}
+
 Previous JSON:
 {previous_json}
 
@@ -417,7 +393,7 @@ Original OCR text:
 # definitions) is already ~2,500 tokens BEFORE the OCR text is appended at
 # the end of the prompt, so with the default num_ctx the model's input gets
 # silently truncated and it never actually sees the bill's OCR text -- it
-# then correctly (per rule 4, "if unknown return null") returns null for
+# then correctly (per rule 2, "if unknown return null") returns null for
 # every field, producing a valid-but-empty JSON object instead of an error.
 # We size num_ctx off the real prompt length (roughly 1 token per 3 chars,
 # generously rounded up) so this scales automatically for long multi-page
@@ -489,9 +465,23 @@ def _call_ollama(client, model, prompt, ocr_text_for_sizing=""):
     return response["message"]["content"]
 
 
+# ── Reasoning-scratchpad cleanup ────────────────────────────────────────────
+#
+# "_reasoning" in the schema exists purely to make the model think before
+# filling the real fields (structured-reasoning technique). It's not part
+# of the bill data and must never reach validate_total(),
+# validate_line_items(), calculate_extraction_reliability() in backend.py,
+# or the final returned result.
+
+def strip_reasoning_field(result):
+    if result and "_reasoning" in result:
+        result.pop("_reasoning")
+    return result
+
+
 # ── Deterministic dropped-decimal fix ──────────────────────────────────────
 #
-# Rule 15 in the prompt asks the model to reinsert a decimal point OCR
+# Rule 13 in the prompt asks the model to reinsert a decimal point OCR
 # dropped from a currency amount (e.g. "500000" in the raw text really means
 # 5000.00). In practice the model doesn't always follow that instruction
 # reliably. Rather than depending purely on prompt compliance, cross-check
@@ -527,7 +517,7 @@ def _find_dropped_decimal_candidates(ocr_text):
 
 
 def fix_dropped_decimals(result, ocr_text):
-    """Safety net for rule 15. Divide any item amount/unit_price (or bill-
+    """Safety net for rule 13. Divide any item amount/unit_price (or bill-
     level monetary field) by 100 if its value exactly matches a standalone,
     decimal-less digit run found in the raw OCR text — e.g. an extracted
     amount of 500000 that also appears verbatim as "500000" in the OCR text
@@ -565,9 +555,9 @@ def fix_dropped_decimals(result, ocr_text):
     return result
 
 
-# ── Deterministic amount/discount-swap fix (safety net for rule 18) ───────
+# ── Deterministic amount/discount-swap fix (safety net for rule 14) ───────
 #
-# Even with rule 18 in the prompt, a small model doesn't always get this
+# Even with rule 14 in the prompt, a small model doesn't always get this
 # right: it sometimes still copies unit_price straight into amount, and
 # stashes the REAL line total in "discount" instead (which is nonsensical --
 # there's no discount column value on these bills at all). The telltale
@@ -600,9 +590,49 @@ def fix_amount_discount_swap(result):
     return result
 
 
-# ── Deterministic "Continue" total-suppression (safety net for rule 14) ───
+# ── Trailing tooth/area code cleanup (safety net for rule 10) ─────────────
 #
-# Rule 14 tells the model to null out total_amount when the bill's own text
+# The prompt tells the model to keep item_name clean (product/service name
+# only, no codes), but a small model doesn't always strip a trailing
+# tooth/area/surface number even when it correctly leaves it OUT of
+# quantity. The result is a technically-correct amount with a leftover
+# digit stuck on the end of the name, e.g. "Implant-MegaGen AnyRidge 23"
+# instead of "Implant-MegaGen AnyRidge". Strip it in code as a final pass,
+# since this is a simple, low-risk text cleanup rather than a judgment call
+# the model needs to make.
+#
+# Matches a trailing whitespace/hyphen followed by one or more short
+# (1-2 digit) numbers, optionally comma/hyphen-separated (covers single
+# teeth like "23", multi-tooth spans like "11,12" or "23-24"). Deliberately
+# narrow: this must NOT match things like "2.5ML" or "5ml" that are part of
+# a real product name, so it only fires on a BARE trailing number with no
+# unit/letters attached.
+
+_TRAILING_TOOTH_CODE_RE = re.compile(
+    r'[\s\-]+(\d{1,2}(?:[,\-]\d{1,2})*)\s*$'
+)
+
+
+def strip_trailing_tooth_code(result):
+    if not result:
+        return result
+
+    for item in result.get("items") or []:
+        name = item.get("item_name")
+        if not name:
+            continue
+        match = _TRAILING_TOOTH_CODE_RE.search(name)
+        if match:
+            cleaned = name[:match.start()].rstrip(" -")
+            if cleaned:  # never blank out a name entirely
+                item["item_name"] = cleaned
+
+    return result
+
+
+# ── Deterministic "Continue" total-suppression (safety net for rule 17) ───
+#
+# Rule 17 tells the model to null out total_amount when the bill's own text
 # shows the totals continue onto another page -- but a small model doesn't
 # reliably catch OCR-garbled spellings of "Continue" ("Contnue", "Continu",
 # etc.), and worse, tends to invent a plausible-looking number instead of
@@ -622,6 +652,39 @@ def strip_total_if_continued(result, ocr_text):
         print("  'TOTAL ... Continue' pattern found in OCR text — forcing total_amount to null "
               "(the real total is on a page that wasn't extracted).")
         result["total_amount"] = None
+    return result
+
+
+# ── Deterministic multi-page-indicator total suppression ──────────────────
+#
+# Some multi-page bills don't say "Continue" near TOTAL at all -- instead
+# the ONLY signal that more pages exist is a page-count marker printed
+# elsewhere on the page, e.g. "Page 1 of 2". strip_total_if_continued()
+# above can't catch this case since there's no "Continue" text anywhere in
+# the OCR output. When a document is explicitly on an earlier page than its
+# stated total, the grand total is very likely on a later page that wasn't
+# captured -- but ONLY act on this after the retry-on-mismatch logic has
+# already tried and failed to reconcile items with total_amount, since a
+# bill can legitimately restate its running/page subtotal on every page
+# without that being wrong. Nulling total_amount just because a bill says
+# "Page 1 of 2" -- even when the numbers already add up cleanly -- would be
+# an overcorrection.
+
+_MULTI_PAGE_RE = re.compile(r'\bPage\s*(\d+)\s*of\s*(\d+)\b', re.IGNORECASE)
+
+
+def strip_total_if_incomplete_page(result, ocr_text):
+    if not result or not ocr_text:
+        return result
+    match = _MULTI_PAGE_RE.search(ocr_text)
+    if match:
+        current_page, total_pages = int(match.group(1)), int(match.group(2))
+        if current_page < total_pages and result.get("total_amount") is not None:
+            print(f"  'Page {current_page} of {total_pages}' found and items still don't "
+                  f"reconcile with total_amount after retry — this isn't the last page, "
+                  f"forcing total_amount to null (real total is likely on a later page "
+                  f"that wasn't extracted).")
+            result["total_amount"] = None
     return result
 
 
@@ -664,8 +727,10 @@ def extract_with_llm(ocr_text, model="qwen2.5:7b", ollama_host=None, retry_on_mi
                 "_MIN_NUM_PREDICT if this keeps happening."
             )
 
+    result = strip_reasoning_field(result)
     result = fix_dropped_decimals(result, ocr_text)
     result = fix_amount_discount_swap(result)
+    result = strip_trailing_tooth_code(result)
     result = strip_total_if_continued(result, ocr_text)
 
     if retry_on_mismatch:
@@ -679,14 +744,17 @@ def extract_with_llm(ocr_text, model="qwen2.5:7b", ollama_host=None, retry_on_mi
                 computed=validation["computed"],
                 stated=validation["stated"],
                 diff=validation["diff"],
+                schema_reminder=JSON_SCHEMA_REMINDER,
                 previous_json=result,
                 ocr_text=ocr_text,
             )
             retry_output = _call_ollama(client, model, retry_prompt, ocr_text_for_sizing=ocr_text)
             retry_result = repair_llm_json(retry_output)
             if retry_result is not None:
+                retry_result = strip_reasoning_field(retry_result)
                 retry_result = fix_dropped_decimals(retry_result, ocr_text)
                 retry_result = fix_amount_discount_swap(retry_result)
+                retry_result = strip_trailing_tooth_code(retry_result)
                 retry_result = strip_total_if_continued(retry_result, ocr_text)
                 # Re-validate the retry — only accept it if it actually
                 # improved the mismatch, otherwise a bad retry could silently
@@ -699,6 +767,18 @@ def extract_with_llm(ocr_text, model="qwen2.5:7b", ollama_host=None, retry_on_mi
                     print("Retry did not improve the mismatch, keeping first-pass result.")
             else:
                 print("Retry produced unparseable JSON, keeping first-pass result.")
+
+            # After the retry attempt (successful or not), check whether a
+            # mismatch still remains. If so, and the document itself says
+            # this isn't the last page, the honest answer is that we don't
+            # know the real total -- null it out rather than keep a number
+            # that's already been shown not to reconcile.
+            final_validation = validate_total(result)
+            if final_validation["checked"] and not final_validation["match"]:
+                result = strip_total_if_incomplete_page(result, ocr_text)
+
+    result = validate_line_items(result)
+    result = add_computed_subtotal(result)
 
     return result
 
@@ -731,3 +811,89 @@ def validate_total(result):
     except (ValueError, TypeError):
         pass
     return out
+
+
+# ── Per-line-item validation (validate_total only checks the grand total) ──
+#
+# validate_total() catches when the SUM of items doesn't match total_amount,
+# but a bill can pass that check while still having individual rows that are
+# wrong in ways that happen to cancel out, or that simply have no bearing on
+# the total at all if total_amount is null. This does NOT try to guess which
+# field is wrong or silently correct anything (unlike fix_dropped_decimals/
+# fix_amount_discount_swap, which only act on narrow, well-understood
+# signatures) -- it just surfaces likely errors for a human reviewer, the
+# same spirit as validate_total().
+
+_LINE_ITEM_FLAT_TOLERANCE = 2.00  # rupees
+
+
+def validate_line_items(result):
+    """Adds result["line_item_warnings"]: a list of rows where quantity x
+    unit_price doesn't reasonably reconcile with amount. Empty list if every
+    checkable row reconciles (or no rows have enough fields to check).
+    """
+    if not result:
+        return result
+
+    warnings = []
+    for idx, item in enumerate(result.get("items") or []):
+        qty, price, amount = item.get("quantity"), item.get("unit_price"), item.get("amount")
+        if qty is None or price is None or amount is None:
+            continue  # nothing to cross-check without all three
+        try:
+            qty_f, price_f, amount_f = float(qty), float(price), float(amount)
+        except (TypeError, ValueError):
+            continue
+        if qty_f <= 0 or price_f <= 0:
+            continue
+        expected = qty_f * price_f
+        diff = abs(expected - amount_f)
+        # Allow whichever is larger of a flat Rs.2 or 3% of the expected
+        # value, since small legitimate per-line rounding happens.
+        tolerance = max(_LINE_ITEM_FLAT_TOLERANCE, expected * 0.03)
+        if diff > tolerance:
+            warnings.append({
+                "index": idx,
+                "item_name": item.get("item_name"),
+                "quantity": qty_f,
+                "unit_price": price_f,
+                "expected": round(expected, 2),
+                "actual": round(amount_f, 2),
+                "diff": round(diff, 2),
+            })
+
+    if warnings:
+        print(f"  {len(warnings)} line item(s) don't reconcile (quantity x unit_price vs amount):")
+        for w in warnings:
+            print(f"    [{w['index']}] {w['item_name']!r}: {w['quantity']} x {w['unit_price']} "
+                  f"= {w['expected']} but amount is {w['actual']} (diff {w['diff']})")
+
+    result["line_item_warnings"] = warnings
+    return result
+
+
+# ── Computed subtotal fallback ─────────────────────────────────────────────
+#
+# When total_amount ends up null (e.g. strip_total_if_continued /
+# strip_total_if_incomplete_page correctly refuse to guess at a total that
+# isn't on the page), a downstream consumer is left with no total at all.
+# This attaches the sum of whatever items WERE successfully extracted as a
+# clearly-separate "computed_subtotal" field -- never written into
+# total_amount itself, since it's not a substitute for the bill's real
+# total, just the best available fallback figure for review/display. This
+# also gives backend.py's calculate_extraction_reliability() a fallback
+# signal to use when total_amount is null.
+
+def add_computed_subtotal(result):
+    if not result:
+        return result
+    try:
+        computed = sum(
+            float(item["amount"])
+            for item in (result.get("items") or [])
+            if item.get("amount") is not None
+        )
+        result["computed_subtotal"] = round(computed, 2)
+    except (TypeError, ValueError):
+        result["computed_subtotal"] = None
+    return result
